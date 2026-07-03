@@ -1772,4 +1772,4 @@ if run_try_case then
     end)
 end
 
-print_test_report()
+-- print_test_report()
