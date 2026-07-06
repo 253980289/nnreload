@@ -126,12 +126,13 @@ TODO:
 		- 验证观察者模式中函数数组是否会产生热更坑：错误(位)映射新旧函数
 		增加不支持热更的测试用例
 			函数更新而状态保留时有个坑：旧状态不配合新函数时将产生不可预料的结果
-			字段名中包含【.】字符时，会因热更算法中依赖【.】作为路径分隔符而导致热更失败，目前项目配置中包含【.】
+			- 字段名中包含【.】字符时，会因热更算法中依赖【.】作为路径分隔符而导致热更失败，目前项目配置中包含【.】 -- 经测试证明仅在主模块外部依赖字段出现【.】时才会导致热更失败，目前项目中暂未发现这种情况(程序配置中包含的句点是作为参数，所以无影响)
 		针对项目真实代码场景测试
 			工程化接口测试：支持配置排除范围和强制热更模式
 			配置更新测试：包括删除配置项和局部化配置同步性等
 	详细研读和理解本模块核心机制以便完全撑握其用法及注意事项，同时考虑进一步优化方案
 	可考虑但暂不考虑的问题：
+		对dummy采用字符串拼接path模式可考虑优化为按数组模式，这样可以规避掉字段名包含【.】而产生歧义问题，但基于两点原因暂时不改：1.目前项目未发现这类情况且考虑实际正常开发中出现概率会较低；2.修改量有点大，怕产生新bug。(可考虑ai建议：使用 \0 作为路径分量分隔符，彻底消除歧义)
 		考虑是否能借用本模块核心机制重新设计或应用到nnsandbox或nnhotfix模块中以融合各方特长 -- 目前重点考虑本模块而放弃前两者
 		考虑如何100%避免部分热更的情形，即达到事务级别：要么完全成功，要么完全取消无副作用：需要大量测试 -- 似乎实现不了，持续执行的协程主函数没法更新
 		增加nnsandbox模块接口以测试对比与本模块在热更上的效果
@@ -162,6 +163,7 @@ local debug_getupvalue = debug.getupvalue
 local tostring = tostring
 local string_format = string.format
 local table_pack = table.pack
+local package_var = package.loaded -- debug.getregistry()._LOADED -- 简化算法及调试信息直观度
 -- 用于表示“显式写入 nil”的哨兵值，本来用一个空table或空函数是最合适(能保证精确唯一区分)的，但由于逻辑中为简化处理通过类型比较跳过对本值的判断，所以此处不能用table和function类型作标识了，除非重构相关代码判断
 local SENTINEL_NIL = "[SENTINEL_NIL__osd832,fsgsddk566585fdjhdu559594hfghjdgkdcom]"
 local function is_nil(v)
@@ -287,7 +289,7 @@ local function parse_module_var_by_path(path)
 	if nil == mod_name then
 		error("invalid module " .. path)
 	end
-	return parse_var_by_path(path:sub(left), debug.getregistry()._LOADED[mod_name]), mod_name
+	return parse_var_by_path(path:sub(left), package_var[mod_name]), mod_name
 end
 
 local function auto_parse_var_by_path(path)
@@ -859,7 +861,7 @@ end
 	-- 匹配变量：创建映射表、收集外部/全局依赖
 	-- 创建upvalue映射表
 local function reload_list(module_name_list)
-	local REAL_LOADED = debug.getregistry()._LOADED
+	local REAL_LOADED = package_var
 	local all = {} -- 用来存放沙箱环境中热加载产生的所有直接数据及分析数据，为后续合并到真实环境做数据基础
 	for _, require_module_path in ipairs(module_name_list) do
 		debug_log_step("sandbox.require", require_module_path)
@@ -1009,12 +1011,12 @@ end
 
 -- 根据之前沙箱运行记录的数据合并新旧变量：将沙箱应用到真实环境，主要包括模块、函数、表、
 local function merge_all_vars(all) -- 对真实环境有弱污染，此步异常一般影响不大(可能多设置了一些不用的值或设置了一些原为nil的新值，具体影响程度要看具体逻辑)
-	local REAL_LOADED = debug.getregistry()._LOADED
+	local REAL_LOADED = package_var
 	for mod_name, data in pairs(all) do
 		if data.old_module then
 			local map = data.map
 			-- 处理函数映射值的更新
-			merge_funcs(data.upvalues, map, data.debug_map) -- 新函数旧状态保留
+			merge_funcs(data.upvalues, map, data.debug_map) -- 设置新函数join旧状态
 			merge_upvalue_nil_value(data, mod_name) -- 补充函数upvalue nil值更新
 			-- 补充表字段nil值更新
 			merge_tables_nil_value(map, data.debug_map)
@@ -1058,7 +1060,7 @@ end
 -- 解引用所有热更模块内的dummy变量为真实环境值：主要包括全局变量和模块(模块也可理解为全局变量的子值)
 local function solve_globals(all)
 	debug_log_step("solve_globals")
-	local REAL_LOADED = debug.getregistry()._LOADED
+	local REAL_LOADED = package_var
 	local i = 0
 	for mod_name, data in pairs(all) do
 		for gk, item in pairs(data.globals) do
@@ -1137,7 +1139,7 @@ local function update_funcs(all)
 			end
 		end
 	end
-	local root = debug.getregistry()
+	local root = _G -- root_var -- debug.getregistry()
 	local co = coroutine.running()
 	local exclude = { [old_to_new_func_map] = true, [co] = true, [debug_map] = true,}
 
@@ -1354,7 +1356,7 @@ local function update_funcs(all)
 		do_metatable(v)
 	end
 
-	debug_change_info.key_path = "debug.getregistry()"
+	debug_change_info.key_path = "_G" -- "debug.getregistry()"
 	update_funcs_(root)
 	debug_change_info.key_path = ""
 	update_funcs_frame(co, START_FUN_LEVEL) -- 这里会优先遍历本模块及沙箱环境代码而不是实际业务代码，对输出的调试信息分析不利，所以相对原版本调整到最后(即更新的数据尽可能在真实业务路径做，而不是在本模块连接上做)
@@ -1398,7 +1400,7 @@ function M.reload(module_name_list)
 	end
 	reloading = true
 	debug_log_step("init")
-	local REAL_LOADED = debug.getregistry()._LOADED
+	local REAL_LOADED = package_var
 	local need_reload = {}
 	for _, require_module_path in ipairs(module_name_list) do
 		need_reload[require_module_path] = true

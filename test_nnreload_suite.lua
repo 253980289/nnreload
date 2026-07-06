@@ -23,20 +23,20 @@ local reload = require("nnreload") -- nnhotfix|reload|nnreload
 -- reload.print = print
 local fail_detailed_report = false
 local dry_run-- = true
-local run_base_case = true
-local run_craft_supported_case = true -- 测试号[41, 60]的用例表示需要特殊技巧配合才能支持的场景
-local run_compatibility_supported_case = true -- 测试号[61, 100]的用例表示兼容但不推荐的场景
+local run_base_case-- = true
+local run_craft_supported_case -- = true -- 测试号[41, 60]的用例表示需要特殊技巧配合才能支持的场景
+local run_compatibility_supported_case -- = true -- 测试号[61, 100]的用例表示兼容但不推荐的场景
 local run_not_supported_case-- = true -- 测试号[101, 200]的用例表示目前仍不支持的热更场景
 local run_ambiguity_case-- = true -- 测试号[201, 300]的用例表示目前存在歧义的热更场景(需要注意细节点)
 local run_bug_case-- = true -- 坑：测试号[301, 400]的用例表示需要特别规避的不支持的热更场景
 local run_try_case = true -- 新实验用例，结果不确定
 local options = {
         -- for debug
-        -- debug_log_change = print,
+        debug_log_change = print,
         -- debug_log_step = print,
         -- debug_log_new_code = print,
         -- error_log = print,
-        -- show_old_to_new_func_map = print,
+        show_old_to_new_func_map = print,
         after_check_vm_dummy = true,
 
         -- for function
@@ -837,6 +837,76 @@ if run_base_case then
         end)
         reload.set_options(options)
     end
+
+    run_test("22. 普通类型表字段名包含【.】时热更情况", function()
+        local main_name = "test_table_filed_name_with_dot"
+        register_module(main_name, [[
+            local M = {a = {}}
+            function M.fun(param)
+                return M["a.b"]
+            end
+            function M.a.b()
+                return 1
+            end
+            return M
+        ]])
+        clear_module(main_name)
+        local m = require(main_name)
+        assert_equals(m.fun(), nil, "热更前应为nil")
+        assert_equals(m.a.b(), 1, "热更前应为1")
+        register_module(main_name, [[
+            local M = {
+                a = {},
+                ["a.b"] = 1
+            }
+            function M.fun(param)
+                return M["a.b"]
+            end
+            function M.a.b()
+                return 2
+            end
+            return M
+        ]])
+        do_reload(main_name)
+        assert_equals(m.fun(), 1, "热更后期望为1")
+        assert_equals(m.a.b(), 2, "热更后期望为2")
+    end)
+
+    run_test("23. 函数类型表字段名包含点号时热更情况", function()
+        local main_name = "test_dot_key_conflict"
+        -- 第一版：M["a.b"] 和 M.a.b 是两个不同的函数
+        register_module(main_name, [[
+            local M = {
+                a = {},                              -- M.a 是一个子表
+                ["a.b"] = function() return "old_a.b" end  -- 键名为 "a.b"
+            }
+            function M.a.b()                        -- 实际上是 M["a"]["b"]
+                return "old_a_b"
+            end
+            return M
+        ]])
+        clear_module(main_name)
+        local m = require(main_name)
+        assert_equals(m["a.b"](), "old_a.b")
+        assert_equals(m.a.b(),    "old_a_b")
+
+        -- 热更新版本：将两个函数的返回值都改为 new
+        register_module(main_name, [[
+            local M = {
+                a = {},
+                ["a.b"] = function() return "new_a.b" end
+            }
+            function M.a.b()
+                return "new_a_b"
+            end
+            return M
+        ]])
+        do_reload(main_name)
+
+        -- 期望：两个函数都被更新
+        assert_equals(m["a.b"](), "new_a.b", "键名为 'a.b' 的函数未更新！")
+        assert_equals(m.a.b(),    "new_a_b", "子表函数应该更新")
+    end)
 end
 
 if run_craft_supported_case then
@@ -1548,6 +1618,62 @@ if run_ambiguity_case then
         assert_equals(m.call(), 1, "到底是要更新还是不要更新其实是有歧义的")
         assert_equals(m.call(), 2, "到底是要更新还是不要更新其实是有歧义的")
     end)
+
+    run_test("206. 歧义：主模块代码(函数中引用不受影响)依赖的外部变量(全局变量/模块)字段键名包含点号时，dummy 解析存在歧义bug", function()
+        local ext_name = "test_dot_dummy_ext"
+        local main_name = "test_dot_dummy_main"
+
+        -- 创建外部模块，字段键名为 "a.b"
+        register_module(ext_name, [[
+            return {
+                ["a.b"] = 100,
+                a = {
+                    b = 200,
+                }
+            }
+        ]])
+        clear_module(ext_name)
+        require(ext_name)  -- 确保外部模块已加载
+
+        -- 主模块引用这个字段
+        register_module(main_name, [[
+            local ext = require("test_dot_dummy_ext")
+            local M = {}
+            function M.get()
+                return ext["a.b"]
+            end
+            function M.get2()
+                return ext.a.b
+            end
+            return M
+        ]])
+        clear_module(main_name)
+        local main = require(main_name)
+        assert_equals(main.get(), 100, "热更前应返回 100")
+
+        -- 热更新主模块（代码逻辑不变）
+        register_module(main_name, [[
+            local ext = require("test_dot_dummy_ext")
+            local M = {
+                ext1 = require("test_dot_dummy_ext")["a.b"],
+                ext2 = require("test_dot_dummy_ext").a.b,
+            }
+            function M.get()
+                return ext["a.b"]
+            end
+            function M.get2()
+                return ext.a.b
+            end
+            return M
+        ]])
+        do_reload(main_name)
+
+        -- 检查热更后是否仍能正确获取值
+        assert_equals(main.get(), 100, "dummy 主模块未包含路径解析应该正确")
+        assert_equals(main.get2(), 200, "dummy 主模块未包含路径解析应该正确")
+        assert_equals(main.ext1, 100, "dummy 主模块包含路径解析应该正确")
+        assert_equals(main.ext2, 200, "dummy 主模块包含路径解析应该正确")
+    end)
 end
 
 if run_bug_case then
@@ -1731,45 +1857,54 @@ if run_bug_case then
         m.call() -- 将报错
         -- assert_equals(m.data, 2, "热更后期望为2")
     end)
+
+    run_test("305. 不支持：外部模块字段键名含点号且在主模块顶层引用时，dummy 解析歧义导致值丢失", function()
+        local ext_name = "test_dot_ext"
+        local main_name = "test_dot_main"
+
+        -- 1. 创建并加载外部模块，有一个键名 "a.b" 的字段
+        register_module(ext_name, [[
+            return { ["a.b"] = 999 }
+        ]])
+        clear_module(ext_name)
+        require(ext_name)
+
+        -- 2. 主模块：在主模块顶层直接将 ext["a.b"] 的值作为 upvalue 引用
+        register_module(main_name, [[
+            local ext = require("test_dot_ext")
+            local val = ext["a.b"]   -- 这里 val 成为外部依赖 dummy
+            local M = {}
+            function M.get()
+                return val
+            end
+            return M
+        ]])
+        clear_module(main_name)
+        local main = require(main_name)
+        assert_equals(main.get(), 999, "热更前应为 999")
+
+        -- 3. 热更新主模块（逻辑不变，只是重新加载）
+        register_module(main_name, [[
+            local ext = require("test_dot_ext")
+            local val = ext["a.b"]
+            local M = {}
+            function M.get()
+                return val
+            end
+            return M
+        ]])
+        do_reload(main_name)
+
+        -- 4. 检验：热更后 val 应该仍然是 999
+        -- 但因为 dummy 路径 "[test_dot_ext].a.b" 被 parse_var_by_path 拆成 ["a"]["b"]，
+        -- 找不到值，val 会被置为 nil
+        assert_equals(main.get(), 999, "dummy 解析歧义导致外部变量值丢失")
+    end)
 end
 
 
 if run_try_case then
     print("-----------------以下为新实验用例，结果不确定----------------------")
-
-    run_test("new. 表字段名包含【.】时热更情况", function()
-        local main_name = "test_table_filed_name_with_dot"
-        register_module(main_name, [[
-            local M = {a = {}}
-            function M.fun(param)
-                return M["a.b"]
-            end
-            function M.a.b()
-                return 1
-            end
-            return M
-        ]])
-        clear_module(main_name)
-        local m = require(main_name)
-        assert_equals(m.fun(), nil, "热更前应为nil")
-        assert_equals(m.a.b(), 1, "热更前应为1")
-        register_module(main_name, [[
-            local M = {
-                a = {},
-                ["a.b"] = 1
-            }
-            function M.fun(param)
-                return M["a.b"]
-            end
-            function M.a.b()
-                return 2
-            end
-            return M
-        ]])
-        do_reload(main_name)
-        assert_equals(m.fun(), 1, "热更后期望为1")
-        assert_equals(m.a.b(), 2, "热更后期望为2")
-    end)
 end
 
 print_test_report()
